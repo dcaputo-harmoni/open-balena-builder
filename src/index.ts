@@ -4,16 +4,27 @@ import { spawn } from 'child_process';
 import * as crypto from 'crypto';
 import { once } from 'events';
 import * as stream from 'stream';
+import axios from 'axios';
 
 const PORT = 80;
 const DEBUG = true;
 
 // Pull environment variables
 const balenaTld = String(process.env.BALENA_TLD);
-const registryHost = String(process.env.REGISTRY_HOST);
+const apiHost = String(process.env.API_HOST ?? `api.${balenaTld}`);
+const registryHost = String(
+  process.env.REGISTRY_HOST ?? `registry.${balenaTld}`
+);
 const builderToken = String(process.env.TOKEN_AUTH_BUILDER_TOKEN);
+const dockerHost = String(process.env.DOCKER_HOST);
+const dockerHostArm64 = String(process.env.DOCKER_HOST_ARM64 ?? '');
 
-const exec = async (cmd: string[], cwd: string, noWait?: boolean) => {
+const exec = async (
+  cmd: string[],
+  cwd: string,
+  envAdd?: any,
+  noWait?: boolean
+) => {
   // remove any empty parameters
   cmd = cmd.filter((x) => x?.length > 0);
   if (DEBUG) console.log(`[open-balena-builder] Executing command: ${cmd}`);
@@ -22,9 +33,10 @@ const exec = async (cmd: string[], cwd: string, noWait?: boolean) => {
   const env = {
     BALENARC_BALENA_URL: balenaTld,
     BALENARC_DATA_DIRECTORY: cwd,
-    DOCKER_HOST: `tcp://openbalena-dind:2375`,
     DOCKER_CONFIG: `${cwd}/.docker`,
     DOCKER_BUILDKIT: '0',
+    DOCKER_HOST: dockerHost,
+    ...(envAdd ?? {}),
   };
 
   // split base command from args
@@ -61,8 +73,8 @@ async function createHttpServer(listenPort: number) {
     let workdir;
 
     try {
-      const { slug, dockerfilePath, emulated, nocache, headless, isdraft } =
-        req.query;
+      const { slug, dockerfilePath, nocache, headless, isdraft } = req.query;
+      let { emulated } = req.query;
       const jwt = req.headers.authorization?.split(' ')?.[1];
       if (DEBUG)
         console.log(
@@ -78,13 +90,6 @@ async function createHttpServer(listenPort: number) {
         );
       if (!slug) throw new Error('app slug must be specified');
       if (!jwt) throw new Error('authorization header must be provided');
-
-      if (emulated === 'true') {
-        // Set DOCKER_HOST to amd64
-        // add --emulated to balena deploy
-      } else {
-        // Set DOCKER_HOST to arm64
-      }
 
       // Set up workdir
       const uuid = crypto.randomUUID();
@@ -103,6 +108,36 @@ async function createHttpServer(listenPort: number) {
       // Authenticate with openbalena
       await exec(['/usr/local/bin/balena', 'login', '-t', jwt], workdir);
 
+      // Get application architecture
+      const arch = (
+        await axios.get(
+          `https://${apiHost}/v6/cpu_architecture?$select=slug&$filter=is_supported_by__device_type/any(dt:dt/is_default_for__application/any(a:a/slug%20eq%20%27${slug}%27))`,
+          {
+            headers: {
+              Authorization: `Bearer ${jwt}`,
+            },
+          }
+        )
+      )?.data?.d?.[0]?.slug;
+
+      // Set docker host for arm64 architecture, otherwise force emulated if arm64 host not available
+      const envAdd: any = {};
+      if (arch === 'aarch64') {
+        if (dockerHostArm64 !== '') {
+          if (DEBUG)
+            console.log(
+              '[open-balena-builder] Application has aarch64 and arm64 builder avialable; running build on native arm64 builder'
+            );
+          envAdd.DOCKER_HOST = dockerHostArm64;
+        } else {
+          if (DEBUG)
+            console.log(
+              '[open-balena-builder] Application has aarch64 and no arm64 builder avialable; running emulated build'
+            );
+          emulated = 'true';
+        }
+      }
+
       // Build image and return stream
       const { spawnStream } = await exec(
         [
@@ -110,11 +145,12 @@ async function createHttpServer(listenPort: number) {
           'deploy',
           String(slug),
           '--build',
-          '--emulated',
+          emulated === 'true' ? '--emulated' : '',
           nocache === 'true' ? '--nocache' : '',
           dockerfilePath !== '' ? `--dockerfile=${dockerfilePath}` : '',
         ],
         workdir,
+        envAdd,
         true
       );
 
@@ -231,10 +267,14 @@ async function createHttpServer(listenPort: number) {
       workdir = tmpWorkdir;
       fs.mkdirSync(tmpWorkdir);
 
+      // TO DO: Only do if arm64 architecture verified and dockerHostArm64 is set
+      const envAdd = dockerHostArm64 ? { DOCKER_HOST: dockerHostArm64 } : {};
+
       // Authenticate with registry
       await exec(
         ['docker', 'login', '-u', 'builder', '-p', builderToken, registryHost],
-        workdir
+        workdir,
+        envAdd
       );
 
       // Check if we are currently building delta image in a parallel process, if so, wait until complete
@@ -249,8 +289,13 @@ async function createHttpServer(listenPort: number) {
 
       // Determine if delta image already exists in registry
       const exists =
-        (await exec(['docker', 'manifest', 'inspect', deltaImgPath], workdir))
-          .code === 0;
+        (
+          await exec(
+            ['docker', 'manifest', 'inspect', deltaImgPath],
+            workdir,
+            envAdd
+          )
+        ).code === 0;
 
       // Build delta image only if it doesn't already exist in the registry
       if (!exists) {
@@ -295,7 +340,8 @@ async function createHttpServer(listenPort: number) {
             `-t${diffImgFull}`,
             '.',
           ],
-          workdir
+          workdir,
+          envAdd
         );
 
         // Generate delta dockerfile
@@ -321,14 +367,19 @@ async function createHttpServer(listenPort: number) {
             `-t${deltaImgPath}`,
             '.',
           ],
-          workdir
+          workdir,
+          envAdd
         );
 
         // Push delta image
-        await exec(['docker', 'push', deltaImgPath], workdir);
+        await exec(['docker', 'push', deltaImgPath], workdir, envAdd);
 
         // Delete diff and delta images (not needed locally)
-        await exec(['docker', 'rmi', diffImgFull, deltaImgPath], workdir);
+        await exec(
+          ['docker', 'rmi', diffImgFull, deltaImgPath],
+          workdir,
+          envAdd
+        );
       }
 
       resp = JSON.stringify({ success: true, name: deltaImgPath });
