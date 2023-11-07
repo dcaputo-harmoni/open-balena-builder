@@ -13,21 +13,17 @@ WORKDIR /workdir
 RUN git clone --quiet https://github.com/da-x/deltaimage.git
 RUN cd deltaimage && ./run build-small-static-exe
 
-# Note we are using sid for buildah 1.32 which supports auth on manifest inspect
-# Once trixie is finalized we can move to stable
-
-FROM debian:sid
+FROM debian:bookworm
 
 EXPOSE 80
 
-RUN apt-get update && apt-get install -y nodejs npm podman-docker iptables
+RUN apt-get update && apt-get install -y nodejs npm docker-compose
 
 RUN npm install -g --no-fund --no-update-notifier \
     balena-cli \
     typescript
 
 COPY --from=builder /workdir/deltaimage/target/*/release-lto/deltaimage /opt/deltaimage
-COPY ./podman/storage.conf /etc/containers/storage.conf
 
 WORKDIR /usr/src/app
 
