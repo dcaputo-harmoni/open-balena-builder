@@ -82,6 +82,8 @@ async function createHttpServer(listenPort: number) {
       if (emulated === 'true') {
         // Set DOCKER_HOST to amd64
         // add --emulated to balena deploy
+      } else {
+        // Set DOCKER_HOST to arm64
       }
 
       // Set up workdir
@@ -109,6 +111,8 @@ async function createHttpServer(listenPort: number) {
           String(slug),
           '--build',
           '--emulated',
+          nocache === 'true' ? '--nocache' : '',
+          dockerfilePath !== '' ? `--dockerfile=${dockerfilePath}` : '',
         ],
         workdir,
         true
