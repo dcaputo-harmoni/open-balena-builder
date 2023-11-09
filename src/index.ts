@@ -242,22 +242,23 @@ async function createHttpServer(listenPort: number) {
       if (!srcMatch || !destMatch)
         throw new Error('src and dest url params must be provided');
       if (!jwt) throw new Error('authorization header must be provided');
-      const [, srcImgVer, srcImg] = srcMatch;
-      const [, destImgVer, destImg] = destMatch;
+      const [, srcImgVer, srcImgBase] = srcMatch;
+      const [, destImgVer, destImgBase] = destMatch;
       if (srcImgVer !== destImgVer) {
         throw new Error('src and dest image versions must match');
       }
 
       // Generate delta image name and path
-      const deltaTag = `delta-${String(srcImg).substring(0, 16)}`;
-      const deltaImg = `${destImg}:${deltaTag}`;
-      const deltaImgPath = `${registryHost}/${deltaImg}`;
+      const deltaTag = `delta-${String(srcImgBase).substring(0, 16)}`;
+      const deltaImgBase = `${destImgBase}:${deltaTag}`;
+      const deltaImgFull = `v${destImgVer}/${deltaImgBase}`;
+      const deltaImgPath = `${registryHost}/${deltaImgFull}`;
 
       // Determine folders to work in and diff image name
       const uuid = crypto.randomUUID();
       const diffImgFull = `local/${uuid}`;
       const tmpWorkdir = `/tmp/${uuid}`;
-      const buildWorkdir = `/tmp/${deltaImg}`;
+      const buildWorkdir = `/tmp/${deltaImgBase}`;
 
       // set tmpWorkdir as active workdir and create it
       workdir = tmpWorkdir;
