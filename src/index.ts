@@ -172,32 +172,29 @@ async function createHttpServer(listenPort: number) {
         });
 
         // Create transformers for stdout/stderr feeds to be handled by balena-cli
+        const transform = function (
+          chunk: Buffer,
+          _encoding: BufferEncoding,
+          callback: stream.TransformCallback
+        ) {
+          const message = chunk.toString();
+          this.push(
+            JSON.stringify({
+              message: {
+                message,
+                isError: message.includes('[Error]'),
+                replace:
+                  message.includes('\u001b[2K\r') || !message.includes('\n'),
+              },
+            })
+          );
+          callback();
+        };
+
         const outTransform = new stream.Transform();
-        outTransform._transform = function (
-          chunk: Buffer,
-          _encoding,
-          callback
-        ) {
-          this.push(
-            JSON.stringify({
-              message: { message: chunk.toString(), isError: false },
-            })
-          );
-          callback();
-        };
+        outTransform._transform = transform;
         const errTransform = new stream.Transform();
-        errTransform._transform = function (
-          chunk: Buffer,
-          _encoding,
-          callback
-        ) {
-          this.push(
-            JSON.stringify({
-              message: { message: chunk.toString(), isError: true },
-            })
-          );
-          callback();
-        };
+        errTransform._transform = transform;
 
         // Pipe output through transformers to balena-cli
         spawnStream.stdout.pipe(outTransform).pipe(res);
@@ -245,23 +242,22 @@ async function createHttpServer(listenPort: number) {
       if (!srcMatch || !destMatch)
         throw new Error('src and dest url params must be provided');
       if (!jwt) throw new Error('authorization header must be provided');
-      const [, srcImgVer, srcImgBase] = srcMatch;
-      const [, destImgVer, destImgBase] = destMatch;
+      const [, srcImgVer, srcImg] = srcMatch;
+      const [, destImgVer, destImg] = destMatch;
       if (srcImgVer !== destImgVer) {
         throw new Error('src and dest image versions must match');
       }
 
       // Generate delta image name and path
-      const deltaTag = `delta-${String(srcImgBase).substring(0, 16)}`;
-      const deltaImgBase = `${destImgBase}:${deltaTag}`;
-      const deltaImgFull = `v${destImgVer}/${deltaImgBase}`;
-      const deltaImgPath = `${registryHost}/${deltaImgFull}`;
+      const deltaTag = `delta-${String(srcImg).substring(0, 16)}`;
+      const deltaImg = `${destImg}:${deltaTag}`;
+      const deltaImgPath = `${registryHost}/${deltaImg}`;
 
       // Determine folders to work in and diff image name
       const uuid = crypto.randomUUID();
       const diffImgFull = `local/${uuid}`;
       const tmpWorkdir = `/tmp/${uuid}`;
-      const buildWorkdir = `/tmp/${deltaImgBase}`;
+      const buildWorkdir = `/tmp/${deltaImg}`;
 
       // set tmpWorkdir as active workdir and create it
       workdir = tmpWorkdir;
