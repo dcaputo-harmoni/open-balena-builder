@@ -379,9 +379,10 @@ async function createHttpServer(listenPort: number) {
         );
       }
 
-      resp = JSON.stringify({ success: true, name: deltaImgPath });
+      resp = JSON.stringify({ name: deltaImgPath });
     } catch (err) {
-      resp = JSON.stringify({ success: false, message: err.message });
+      // Do not return stringified object so that the JSON.parse in supervisor throws an error
+      resp = err.message;
     }
 
     // Delete temp or build directory and all contents
