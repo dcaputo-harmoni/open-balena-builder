@@ -235,8 +235,9 @@ async function createHttpServer(listenPort: number) {
         );
       // Parse input params
       const jwt = req.headers.authorization?.split(' ')?.[1];
-      const srcMatch = /^.*?\/v([0-9]+)\/([0-9a-f]+)$/.exec(String(src));
-      const destMatch = /^.*?\/v([0-9]+)\/([0-9a-f]+)$/.exec(String(dest));
+      const IMG_REGEX = /^.*?\/v([0-9]+)\/([0-9a-f]+)(@sha256:([0-9a-f]+))?$/;
+      const srcMatch = IMG_REGEX.exec(String(src));
+      const destMatch = IMG_REGEX.exec(String(dest));
 
       // Validate input params
       if (!srcMatch || !destMatch)
@@ -391,7 +392,7 @@ async function createHttpServer(listenPort: number) {
 
     // Respond with result
     if (DEBUG) console.log(`[open-balena-builder] RESPONSE: ${resp}`);
-    res.set('Content-Type', 'text/html');
+    res.set('content-type', 'text/plain');
     res.send(resp);
   });
 
