@@ -12,11 +12,7 @@ const DEBUG = true;
 // Pull environment variables
 const balenaTld = String(process.env.BALENA_TLD);
 const apiHost = String(process.env.API_HOST ?? `api.${balenaTld}`);
-const registryHost = String(
-  process.env.REGISTRY_HOST ?? `registry.${balenaTld}`
-);
-const builderToken = String(process.env.TOKEN_AUTH_BUILDER_TOKEN);
-const dockerHost = String(process.env.DOCKER_HOST);
+const dockerHostAmd64 = String(process.env.DOCKER_HOST_AMD64 ?? '');
 const dockerHostArm64 = String(process.env.DOCKER_HOST_ARM64 ?? '');
 
 const exec = async (
@@ -35,7 +31,6 @@ const exec = async (
     BALENARC_DATA_DIRECTORY: cwd,
     DOCKER_CONFIG: `${cwd}/.docker`,
     DOCKER_BUILDKIT: '0',
-    DOCKER_HOST: dockerHost,
     ...(envAdd ?? {}),
   };
 
@@ -91,6 +86,10 @@ async function createHttpServer(listenPort: number) {
       if (!slug) throw new Error('app slug must be specified');
       if (!jwt) throw new Error('authorization header must be provided');
 
+      // Make sure we have a builder
+      if (dockerHostAmd64 === '' && dockerHostArm64 === '')
+        throw new Error('no builder available');
+
       // Set up workdir
       const uuid = crypto.randomUUID();
       workdir = `/tmp/${uuid}`;
@@ -120,21 +119,40 @@ async function createHttpServer(listenPort: number) {
         )
       )?.data?.d?.[0]?.slug;
 
-      // Set docker host for arm64 architecture, otherwise force emulated if arm64 host not available
+      // Try to find native docker builder, otherwise run emulated build
       const envAdd: any = {};
-      if (arch === 'aarch64') {
-        if (dockerHostArm64 !== '') {
+      if (
+        ['amd64', 'i386', 'i386-nlp'].includes(arch) &&
+        dockerHostAmd64 !== ''
+      ) {
+        if (DEBUG)
+          console.log(
+            `[open-balena-builder] Using native amd64 builder to build ${arch} image`
+          );
+        envAdd.DOCKER_HOST = dockerHostAmd64;
+      } else if (
+        ['aarch64', 'armv7hf', 'rpi'].includes(arch) &&
+        dockerHostArm64 !== ''
+      ) {
+        if (DEBUG)
+          console.log(
+            `[open-balena-builder] Using native arm64 builder to build ${arch} image`
+          );
+        envAdd.DOCKER_HOST = dockerHostArm64;
+      } else {
+        emulated = 'true';
+        if (dockerHostAmd64 !== '') {
           if (DEBUG)
             console.log(
-              '[open-balena-builder] Application has aarch64 and arm64 builder avialable; running build on native arm64 builder'
+              `[open-balena-builder] No native builder avialable to build ${arch} image; running emulated build on amd64 builder`
             );
-          envAdd.DOCKER_HOST = dockerHostArm64;
+          envAdd.DOCKER_HOST = dockerHostAmd64;
         } else {
           if (DEBUG)
             console.log(
-              '[open-balena-builder] Application has aarch64 and no arm64 builder avialable; running emulated build'
+              `[open-balena-builder] No native builder avialable for ${arch}; running emulated build on arm64 builder`
             );
-          emulated = 'true';
+          envAdd.DOCKER_HOST = dockerHostArm64;
         }
       }
 
@@ -214,186 +232,6 @@ async function createHttpServer(listenPort: number) {
     // Delete build directory and all contents
     if (workdir && fs.existsSync(workdir))
       fs.rmSync(workdir, { recursive: true });
-  });
-
-  app.get('/api/v3/delta', async (req, res) => {
-    let resp = '';
-
-    // Set up build environment
-    let workdir;
-
-    try {
-      // src = old image which we are transitioning from
-      // dest = new image which we are transitioning to
-      const { src, dest } = req.query;
-      if (DEBUG)
-        console.log(
-          `[open-balena-builder] Delta request received: ${JSON.stringify({
-            src,
-            dest,
-          })}`
-        );
-      // Parse input params
-      const jwt = req.headers.authorization?.split(' ')?.[1];
-      const IMG_REGEX = /^.*?\/v([0-9]+)\/([0-9a-f]+)(@sha256:([0-9a-f]+))?$/;
-      const srcMatch = IMG_REGEX.exec(String(src));
-      const destMatch = IMG_REGEX.exec(String(dest));
-
-      // Validate input params
-      if (!srcMatch || !destMatch)
-        throw new Error('src and dest url params must be provided');
-      if (!jwt) throw new Error('authorization header must be provided');
-      const [, srcImgVer, srcImgBase] = srcMatch;
-      const [, destImgVer, destImgBase] = destMatch;
-      if (srcImgVer !== destImgVer) {
-        throw new Error('src and dest image versions must match');
-      }
-
-      // Generate delta image name and path
-      const deltaTag = `delta-${String(srcImgBase).substring(0, 16)}`;
-      const deltaImgBase = `${destImgBase}:${deltaTag}`;
-      const deltaImgFull = `v${destImgVer}/${deltaImgBase}`;
-      const deltaImgPath = `${registryHost}/${deltaImgFull}`;
-
-      // Determine folders to work in and diff image name
-      const uuid = crypto.randomUUID();
-      const diffImgFull = `local/${uuid}`;
-      const tmpWorkdir = `/tmp/${uuid}`;
-      const buildWorkdir = `/tmp/${deltaImgBase}`;
-
-      // set tmpWorkdir as active workdir and create it
-      workdir = tmpWorkdir;
-      fs.mkdirSync(tmpWorkdir);
-
-      // TO DO: Only do if arm64 architecture verified and dockerHostArm64 is set
-      const envAdd = dockerHostArm64 ? { DOCKER_HOST: dockerHostArm64 } : {};
-
-      // Authenticate with registry
-      await exec(
-        ['docker', 'login', '-u', 'builder', '-p', builderToken, registryHost],
-        workdir,
-        envAdd
-      );
-
-      // Check if we are currently building delta image in a parallel process, if so, wait until complete
-      if (fs.existsSync(buildWorkdir)) {
-        let elapsedSecs = 0;
-        const sec = () => new Promise((resolve) => setTimeout(resolve, 1000));
-        do {
-          await sec();
-          elapsedSecs++;
-        } while (fs.existsSync(buildWorkdir) && elapsedSecs < 60 * 20); // 20 min timeout
-      }
-
-      // Determine if delta image already exists in registry
-      const exists =
-        (
-          await exec(
-            ['docker', 'manifest', 'inspect', deltaImgPath],
-            workdir,
-            envAdd
-          )
-        ).code === 0;
-
-      // Build delta image only if it doesn't already exist in the registry
-      if (!exists) {
-        // Move temp to build directory and populate with deltaimage binary
-        fs.mkdirSync(buildWorkdir);
-        fs.cpSync(`${tmpWorkdir}/.docker`, `${buildWorkdir}/.docker`, {
-          recursive: true,
-        });
-        fs.cpSync(`/opt/deltaimage`, `${buildWorkdir}/deltaimage`);
-        fs.rmSync(tmpWorkdir, { recursive: true });
-        workdir = buildWorkdir;
-
-        // Setup build params
-        const quiet = DEBUG ? '' : '--quiet';
-
-        // Generate diff dockerfile
-        fs.writeFileSync(
-          `${buildWorkdir}/Dockerfie.diff`,
-          (
-            await exec(
-              [
-                '/opt/deltaimage',
-                'docker-file',
-                'diff',
-                String(src),
-                String(dest),
-              ],
-              workdir
-            )
-          ).stdout
-            .toString()
-            .replace(/--from=deltaimage\/deltaimage:0.1.0 \/opt/g, '.')
-        );
-
-        // Build diff image (--no-cache)
-        await exec(
-          [
-            'docker',
-            'build',
-            quiet,
-            '-fDockerfie.diff',
-            `-t${diffImgFull}`,
-            '.',
-          ],
-          workdir,
-          envAdd
-        );
-
-        // Generate delta dockerfile
-        fs.writeFileSync(
-          `${buildWorkdir}/Dockerfie.delta`,
-          (
-            await exec(
-              ['/opt/deltaimage', 'docker-file', 'apply', diffImgFull],
-              workdir
-            )
-          ).stdout
-            .toString()
-            .replace(/--from=deltaimage\/deltaimage:0.1.0 \/opt/g, '.')
-        );
-
-        // Build delta image (--no-cache)
-        await exec(
-          [
-            'docker',
-            'build',
-            quiet,
-            '-fDockerfie.delta',
-            `-t${deltaImgPath}`,
-            '.',
-          ],
-          workdir,
-          envAdd
-        );
-
-        // Push delta image
-        await exec(['docker', 'push', deltaImgPath], workdir, envAdd);
-
-        // Delete diff and delta images (not needed locally)
-        await exec(
-          ['docker', 'rmi', diffImgFull, deltaImgPath],
-          workdir,
-          envAdd
-        );
-      }
-
-      resp = JSON.stringify({ name: deltaImgPath });
-    } catch (err) {
-      // Do not return stringified object so that the JSON.parse in supervisor throws an error
-      resp = err.message;
-    }
-
-    // Delete temp or build directory and all contents
-    if (workdir && fs.existsSync(workdir))
-      fs.rmSync(workdir, { recursive: true });
-
-    // Respond with result
-    if (DEBUG) console.log(`[open-balena-builder] RESPONSE: ${resp}`);
-    res.set('content-type', 'text/plain');
-    res.send(resp);
   });
 
   app.listen(listenPort, () => {
