@@ -424,7 +424,8 @@ async function createHttpServer(listenPort: number) {
 
         if (releaseCode === 0) {
           log('Successfully finalized release');
-          res.write('[Success] Release finalized!');
+          const message = '[Success] Release finalized!';
+          res.write(JSON.stringify({ message: { message } }));
         } else throw new Error('Failed to finalize release');
       }
 
