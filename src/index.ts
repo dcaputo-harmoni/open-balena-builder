@@ -13,7 +13,7 @@ const DEBUG = true;
 // Pull environment variables
 const balenaTld = String(process.env.BALENA_TLD);
 const apiHost = String(process.env.API_HOST ?? `api.${balenaTld}`);
-const deltaHost = String(process.env.DELTA_HOST ?? `delta.${balenaTld}`);
+const deltaHost = String(process.env.DELTA_HOST ?? '');
 const dockerHostAmd64 = String(process.env.DOCKER_HOST_AMD64 ?? '');
 const dockerHostArm64 = String(process.env.DOCKER_HOST_ARM64 ?? '');
 const builderToken = String(process.env.TOKEN_AUTH_BUILDER_TOKEN);
@@ -357,35 +357,38 @@ async function createHttpServer(listenPort: number) {
 
       if (newCommit === '') throw new Error('Build error');
 
-      // Get previous release images
-      const oldReleaseId = await getReleaseIdForApp(String(slug), token);
-      const newReleaseId = await getReleaseIdFromCommit(newCommit, token);
-      const deltas = await generateDeltas(oldReleaseId, newReleaseId, token);
-
       const spinner = createSpinner();
 
-      await runSpinner(res, spinner, `[Delta] Creating image deltas...`, () =>
-        Promise.all(
-          deltas.map(async (delta) => {
-            log(`Generating delta for ${delta.src} to ${delta.dest}`);
-            const registry = delta.src.split('/')[0];
-            const deltaToken = (
-              await axios.get(
-                `https://${apiHost}/auth/v1/token?service=${registry}&scope=repository:${delta.src}:pull&scope=repository:${delta.dest}:pull`,
-                { auth: { username: 'builder', password: builderToken } }
-              )
-            )?.data?.token;
-            return axios
-              .get(
-                `https://${deltaHost}/api/v3/delta?src=${delta.src}&dest=${delta.dest}&wait=true`,
-                { headers: { Authorization: `Bearer ${deltaToken}` } }
-              )
-              .then(({ data }) =>
-                log(`Successfully generated delta: ${data?.name}`)
-              );
-          })
-        )
-      );
+      // Only create delta updates if DELTA_HOST is set
+      if (deltaHost !== '') {
+        // Get previous release images
+        const oldReleaseId = await getReleaseIdForApp(String(slug), token);
+        const newReleaseId = await getReleaseIdFromCommit(newCommit, token);
+        const deltas = await generateDeltas(oldReleaseId, newReleaseId, token);
+
+        await runSpinner(res, spinner, `[Delta] Creating image deltas...`, () =>
+          Promise.all(
+            deltas.map(async (delta) => {
+              log(`Generating delta for ${delta.src} to ${delta.dest}`);
+              const registry = delta.src.split('/')[0];
+              const deltaToken = (
+                await axios.get(
+                  `https://${apiHost}/auth/v1/token?service=${registry}&scope=repository:${delta.src}:pull&scope=repository:${delta.dest}:pull`,
+                  { auth: { username: 'builder', password: builderToken } }
+                )
+              )?.data?.token;
+              return axios
+                .get(
+                  `https://${deltaHost}/api/v3/delta?src=${delta.src}&dest=${delta.dest}&wait=true`,
+                  { headers: { Authorization: `Bearer ${deltaToken}` } }
+                )
+                .then(({ data }) =>
+                  log(`Successfully generated delta: ${data?.name}`)
+                );
+            })
+          )
+        );
+      }
 
       if (isdraft === 'false') {
         log('Finalizing release');
