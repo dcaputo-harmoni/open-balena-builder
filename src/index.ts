@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Response } from 'express';
 import * as fs from 'fs';
 import { spawn } from 'child_process';
 import * as crypto from 'crypto';
@@ -21,6 +21,71 @@ const builderToken = String(process.env.TOKEN_AUTH_BUILDER_TOKEN);
 // Debug healper function
 const log = (msg: string) => {
   if (DEBUG) console.log(`[open-balena-builder] ${msg}`);
+};
+
+// Spinner helper functions inspired by balena-cli release spinner
+function createRunLoop(tick: (...args: any[]) => void) {
+  const timerId = setInterval(tick, 1000 / 10);
+  const runloop = {
+    onEnd() {
+      // noop
+    },
+    end() {
+      clearInterval(timerId);
+      return runloop.onEnd();
+    },
+  };
+  return runloop;
+}
+
+function createSpinner() {
+  const chars = '|/-\\';
+  let index = 0;
+  return () => chars[index++ % chars.length];
+}
+
+async function runSpinner<T>(
+  res: Response,
+  spinner: () => string,
+  msg: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const writeLine = (str: string, replace: boolean) =>
+    res.write(JSON.stringify({ message: { message: str, replace } }));
+  const clearLine = () =>
+    res.write(JSON.stringify({ message: { message: '', replace: true } }));
+  const runloop = createRunLoop(function () {
+    clearLine();
+    writeLine(`${msg} ${spinner()}`, true);
+  });
+  runloop.onEnd = function () {
+    clearLine();
+    writeLine(msg, false);
+  };
+  try {
+    return await fn();
+  } finally {
+    runloop.end();
+  }
+}
+
+// Stream transformer for stdout/stderr feeds to be handled by balena-cli
+const transform = function (
+  chunk: Buffer,
+  _encoding: BufferEncoding,
+  callback: stream.TransformCallback
+) {
+  const message = chunk.toString();
+  this.push(
+    JSON.stringify({
+      message: {
+        message,
+        isError: message.includes('[Error]'),
+        replace: message.includes('\u001b[2K\r') || !message.includes('\n'),
+      },
+    })
+  );
+  callback();
 };
 
 // Helper function to execute shell commands
@@ -51,14 +116,26 @@ const exec = async (
   let code = 0,
     stdout = '',
     stderr = '';
-  spawnStream.stdout.on('data', (data) => {
-    log(`[${baseCmd}/stdout]: ${data}`);
-    stdout += data;
-  });
-  spawnStream.stderr.on('data', (data) => {
-    log(`[${baseCmd}/stderr]: ${data}`);
-    stderr += data;
-  });
+  spawnStream.stdout.on('data', (data) =>
+    data
+      .toString()
+      .split(/\r\n|\n|\r/)
+      .forEach((line: string) => {
+        line = line.replace(/[^ -~]+/g, '').replace(/\[.{0,3}[KAHmlh]$/g, '');
+        if (line.trim().length > 0) log(`[${baseCmd}/stdout]: ${line}`);
+        stdout += data;
+      })
+  );
+  spawnStream.stderr.on('data', (data) =>
+    data
+      .toString()
+      .split(/\r\n|\n|\r/)
+      .forEach((line: string) => {
+        line = line.replace(/[^ -~]+/g, '').replace(/\[.{0,3}[KAHmlh]$/g, '');
+        if (line.trim().length > 0) log(`[${baseCmd}/stderr]: ${line}`);
+        stderr += data;
+      })
+  );
   spawnStream.on('close', (rc: number) => {
     log(`[${baseCmd}/close]: ${code}`);
     code = rc;
@@ -84,11 +161,20 @@ const getArch = async (slug: string, token: string) =>
     )
   )?.[0]?.slug;
 
-// Helper function to get application release id
-const getReleaseId = async (slug: string, token: string) =>
+// Helper function to get active release id for application
+const getReleaseIdForApp = async (slug: string, token: string) =>
   (
     await apiGet(
       `application?$select=should_be_running__release/id&$filter=slug%20eq%20%27${slug}%27`,
+      token
+    )
+  )?.[0]?.id;
+
+// Helper function to get release id from commit
+const getReleaseIdFromCommit = async (commit: string, token: string) =>
+  (
+    await apiGet(
+      `release?$select=id&$filter=commit%20eq%20%27${commit}%27`,
       token
     )
   )?.[0]?.id;
@@ -143,7 +229,7 @@ async function createHttpServer(listenPort: number) {
 
   app.post('/v3/build', async (req, res) => {
     // Set up build environment
-    let workdir;
+    let workdir = '';
 
     let headlessReturned = false;
 
@@ -160,7 +246,6 @@ async function createHttpServer(listenPort: number) {
       );
       if (!slug) throw new Error('app slug must be specified');
       if (!token) throw new Error('authorization header must be provided');
-      if (isdraft) throw new Error('draft builds are not yet supported');
 
       // Make sure we have a builder
       if (dockerHostAmd64 === '' && dockerHostArm64 === '')
@@ -172,10 +257,8 @@ async function createHttpServer(listenPort: number) {
       fs.mkdirSync(workdir);
 
       // Extract tar stream to workdir
-      if (!req.query.test) {
-        req.pipe(tar.x({ cwd: workdir }));
-        await once(req, 'end');
-      }
+      req.pipe(tar.x({ cwd: workdir }));
+      await once(req, 'end');
 
       // Authenticate with openbalena
       await exec(['/usr/local/bin/balena', 'login', '-t', token], workdir);
@@ -213,15 +296,16 @@ async function createHttpServer(listenPort: number) {
       }
 
       // Get previous release images
-      const oldReleaseId = await getReleaseId(String(slug), token);
+      const activeReleaseId = await getReleaseIdForApp(String(slug), token);
 
-      // Build image and return stream
+      // Build image, deploy as draft release, and return stream
       const { spawnStream } = await exec(
         [
-          req.query.test ? 'echo' : '/usr/local/bin/balena',
+          '/usr/local/bin/balena',
           'deploy',
           String(slug),
           '--build',
+          '--draft',
           emulated === 'true' ? '--emulated' : '',
           nocache === 'true' ? '--nocache' : '',
           dockerfilePath !== '' ? `--dockerfile=${dockerfilePath}` : '',
@@ -231,8 +315,27 @@ async function createHttpServer(listenPort: number) {
         true
       );
 
+      let newCommit = '';
+
+      spawnStream.stdout.on('data', (data) => {
+        data
+          .toString()
+          .split(/\r\n|\n|\r/)
+          .forEach((line: string) => {
+            line = line
+              .replace(/[^ -~]+/g, '')
+              .replace(/\[.{0,3}[KAHmlh]$/g, '')
+              .trim();
+            const match = /\[Success\] Release: ([0-9a-f]+).*$/.exec(line);
+            if (match) {
+              newCommit = match[1];
+              log(`Parsed release commit: ${newCommit}`);
+            }
+          });
+      });
+
       // Only wait for output when headless is false (default)
-      if (headless === 'false' && !req.query.test) {
+      if (headless === 'false') {
         // Detect abort by client (response closure) and kill build if received
         let finished = false;
         spawnStream.on('close', () => {
@@ -245,34 +348,14 @@ async function createHttpServer(listenPort: number) {
           }
         });
 
-        // Create transformers for stdout/stderr feeds to be handled by balena-cli
-        const transform = function (
-          chunk: Buffer,
-          _encoding: BufferEncoding,
-          callback: stream.TransformCallback
-        ) {
-          const message = chunk.toString();
-          this.push(
-            JSON.stringify({
-              message: {
-                message,
-                isError: message.includes('[Error]'),
-                replace:
-                  message.includes('\u001b[2K\r') || !message.includes('\n'),
-              },
-            })
-          );
-          callback();
-        };
-
         const outTransform = new stream.Transform();
         outTransform._transform = transform;
         const errTransform = new stream.Transform();
         errTransform._transform = transform;
 
         // Pipe output through transformers to balena-cli
-        spawnStream.stdout.pipe(outTransform).pipe(res);
-        spawnStream.stderr.pipe(errTransform).pipe(res);
+        spawnStream.stdout.pipe(outTransform).pipe(res, { end: false });
+        spawnStream.stderr.pipe(errTransform).pipe(res, { end: false });
       } else {
         res.status(200).send('Build started');
         headlessReturned = true;
@@ -281,32 +364,68 @@ async function createHttpServer(listenPort: number) {
       // Wait for build to finish
       await once(spawnStream, 'close');
 
+      if (newCommit === '') throw new Error('Build error');
+
       // Get previous release images
-      const newReleaseId = await getReleaseId(String(slug), token);
-      const deltas = await generateDeltas(
-        req.query.test ? oldReleaseId - 1 : oldReleaseId,
-        newReleaseId,
-        token
+      const newReleaseId = await getReleaseIdFromCommit(newCommit, token);
+
+      // Get previous release images
+      const deltas = await generateDeltas(activeReleaseId, newReleaseId, token);
+
+      const spinner = createSpinner();
+
+      const deltaTokens = (
+        await runSpinner(res, spinner, `[Delta] Authorizing...`, () =>
+          Promise.all(
+            deltas.map((delta) => {
+              const registry = delta.src.split('/')[0];
+              return axios.get(
+                `https://${apiHost}/auth/v1/token?service=${registry}&scope=repository:${delta.src}:pull&scope=repository:${delta.dest}:pull`,
+                { auth: { username: 'builder', password: builderToken } }
+              );
+            })
+          )
+        )
+      ).map((x) => x.data?.token);
+
+      await runSpinner(res, spinner, `[Delta] Creating image deltas...`, () =>
+        Promise.all(
+          deltas.map((delta, i) => {
+            log(`Generating delta for ${delta.src} to ${delta.dest}`);
+            return axios
+              .get(
+                `https://${deltaHost}/api/v3/delta?src=${delta.src}&dest=${delta.dest}&wait=true`,
+                { headers: { Authorization: `Bearer ${deltaTokens[i]}` } }
+              )
+              .then(({ data }) =>
+                log(`Successfully generated delta: ${data?.name}`)
+              );
+          })
+        )
       );
-      for (let i = 0; i < deltas.length; i++) {
-        const delta = deltas[i];
-        log(`Generating delta for ${delta.src} to ${delta.dest}`);
-        // Get registry token for delta process
-        const registry = delta.src.split('/')[0];
-        const deltaToken = (
-          await axios.get(
-            `https://${apiHost}/auth/v1/token?service=${registry}&scope=repository:${delta.src}:pull&scope=repository:${delta.dest}:pull`,
-            { auth: { username: 'builder', password: builderToken } }
+
+      if (isdraft === 'false') {
+        log('Finalizing release');
+
+        const releaseCode = (
+          await runSpinner(
+            res,
+            spinner,
+            `[Release] Finalizing Release...`,
+            () =>
+              exec(
+                ['/usr/local/bin/balena', 'release', 'finalize', newCommit],
+                workdir,
+                envAdd,
+                false
+              )
           )
-        ).data?.token;
-        // Generate delta
-        const deltaName = (
-          await axios.get(
-            `https://${deltaHost}/api/v3/delta?src=${delta.src}&dest=${delta.dest}&wait=true`,
-            { headers: { Authorization: `Bearer ${deltaToken}` } }
-          )
-        )?.data?.name;
-        log(`Successfully generated delta: ${deltaName}`);
+        ).code;
+
+        if (releaseCode === 0) {
+          log('Successfully finalized release');
+          res.write('[Success] Release finalized!');
+        } else throw new Error('Failed to finalize release');
       }
 
       // Delete images or tag images and keep?
@@ -316,12 +435,15 @@ async function createHttpServer(listenPort: number) {
     }
 
     // Delete build directory and all contents
-    if (workdir && fs.existsSync(workdir))
+    if (workdir != '' && fs.existsSync(workdir))
       fs.rmSync(workdir, { recursive: true });
+
+    // Close response
+    res.end();
   });
 
   app.listen(listenPort, () => {
-    console.log(`Listening on port: ${listenPort}`);
+    log(`Listening on port: ${listenPort}`);
   });
 }
 
