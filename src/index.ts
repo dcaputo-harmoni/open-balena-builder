@@ -374,28 +374,21 @@ async function createHttpServer(listenPort: number) {
 
       const spinner = createSpinner();
 
-      const deltaTokens = (
-        await runSpinner(res, spinner, `[Delta] Authorizing...`, () =>
-          Promise.all(
-            deltas.map((delta) => {
-              const registry = delta.src.split('/')[0];
-              return axios.get(
-                `https://${apiHost}/auth/v1/token?service=${registry}&scope=repository:${delta.src}:pull&scope=repository:${delta.dest}:pull`,
-                { auth: { username: 'builder', password: builderToken } }
-              );
-            })
-          )
-        )
-      ).map((x) => x.data?.token);
-
       await runSpinner(res, spinner, `[Delta] Creating image deltas...`, () =>
         Promise.all(
-          deltas.map((delta, i) => {
+          deltas.map(async (delta) => {
             log(`Generating delta for ${delta.src} to ${delta.dest}`);
+            const registry = delta.src.split('/')[0];
+            const deltaToken = (
+              await axios.get(
+                `https://${apiHost}/auth/v1/token?service=${registry}&scope=repository:${delta.src}:pull&scope=repository:${delta.dest}:pull`,
+                { auth: { username: 'builder', password: builderToken } }
+              )
+            )?.data?.token;
             return axios
               .get(
                 `https://${deltaHost}/api/v3/delta?src=${delta.src}&dest=${delta.dest}&wait=true`,
-                { headers: { Authorization: `Bearer ${deltaTokens[i]}` } }
+                { headers: { Authorization: `Bearer ${deltaToken}` } }
               )
               .then(({ data }) =>
                 log(`Successfully generated delta: ${data?.name}`)
