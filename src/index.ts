@@ -187,13 +187,14 @@ const getImages = async (releaseId: number, token: string) => {
     .join(',');
   return (
     (await apiGet(
-      `image?$select=is_stored_at__image_location,is_a_build_of__service/id&$filter=id%20in%20(${imageIds})`,
+      `image?$select=is_stored_at__image_location,content_hash,is_a_build_of__service/id&$filter=id%20in%20(${imageIds})`,
       token
     )) ?? []
   ).map((x: any) => ({
     imageLocation: x.is_stored_at__image_location,
+    contentHash: x.content_hash,
     serviceId: x.id,
-  })) as { imageLocation: string; serviceId: number }[];
+  })) as { imageLocation: string; contentHash: string; serviceId: number }[];
 };
 
 // Helper function to determine which images to generate deltas for
@@ -205,7 +206,8 @@ const generateDeltas = async (oldId: number, newId: number, token: string) => {
     const match = oldImages.find(
       (oldImage) =>
         oldImage.serviceId === newImage.serviceId &&
-        oldImage.imageLocation !== newImage.imageLocation
+        oldImage.imageLocation !== newImage.imageLocation &&
+        oldImage.contentHash !== newImage.contentHash
     );
     if (match)
       deltas.push({
