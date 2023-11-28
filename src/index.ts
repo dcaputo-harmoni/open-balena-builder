@@ -113,9 +113,7 @@ const exec = async (
   const args = cmd.slice(1);
 
   const spawnStream = spawn(baseCmd, args, { cwd, env });
-  let code = 0,
-    stdout = '',
-    stderr = '';
+  let code;
   spawnStream.stdout.on('data', (data) =>
     data
       .toString()
@@ -123,7 +121,6 @@ const exec = async (
       .forEach((line: string) => {
         line = line.replace(/[^ -~]+/g, '').replace(/\[.{0,3}[KAHmlh]$/g, '');
         if (line.trim().length > 0) log(`[${baseCmd}/stdout]: ${line}`);
-        stdout += data;
       })
   );
   spawnStream.stderr.on('data', (data) =>
@@ -133,15 +130,14 @@ const exec = async (
       .forEach((line: string) => {
         line = line.replace(/[^ -~]+/g, '').replace(/\[.{0,3}[KAHmlh]$/g, '');
         if (line.trim().length > 0) log(`[${baseCmd}/stderr]: ${line}`);
-        stderr += data;
       })
   );
   spawnStream.on('close', (rc: number) => {
-    log(`[${baseCmd}/close]: ${code}`);
+    log(`[${baseCmd}/close]: ${rc}`);
     code = rc;
   });
   if (!noWait) await once(spawnStream, 'close');
-  return { code, stdout, stderr, spawnStream };
+  return { code, spawnStream };
 };
 
 // Helper function to get data from open-balena-api
@@ -201,13 +197,9 @@ const getImages = async (releaseId: number, token: string) => {
 };
 
 // Helper function to determine which images to generate deltas for
-const generateDeltas = async (
-  oldReleaseId: number,
-  newReleaseId: number,
-  token: string
-) => {
-  const oldImages = await getImages(oldReleaseId, token);
-  const newImages = await getImages(newReleaseId, token);
+const generateDeltas = async (oldId: number, newId: number, token: string) => {
+  const oldImages = await getImages(oldId, token);
+  const newImages = await getImages(newId, token);
   const deltas: { src: string; dest: string }[] = [];
   newImages.forEach((newImage) => {
     const match = oldImages.find(
@@ -295,9 +287,6 @@ async function createHttpServer(listenPort: number) {
         }
       }
 
-      // Get previous release images
-      const activeReleaseId = await getReleaseIdForApp(String(slug), token);
-
       // Build image, deploy as draft release, and return stream
       const { spawnStream } = await exec(
         [
@@ -367,10 +356,9 @@ async function createHttpServer(listenPort: number) {
       if (newCommit === '') throw new Error('Build error');
 
       // Get previous release images
+      const oldReleaseId = await getReleaseIdForApp(String(slug), token);
       const newReleaseId = await getReleaseIdFromCommit(newCommit, token);
-
-      // Get previous release images
-      const deltas = await generateDeltas(activeReleaseId, newReleaseId, token);
+      const deltas = await generateDeltas(oldReleaseId, newReleaseId, token);
 
       const spinner = createSpinner();
 
