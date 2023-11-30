@@ -1,3 +1,4 @@
+/* eslint-disable indent */
 import express, { Response } from 'express';
 import * as fs from 'fs';
 import { spawn } from 'child_process';
@@ -348,8 +349,9 @@ async function createHttpServer(listenPort: number) {
         spawnStream.stdout.pipe(outTransform).pipe(res, { end: false });
         spawnStream.stderr.pipe(errTransform).pipe(res, { end: false });
       } else {
+        // To do: parse out releaseId from build stream before returning
         res.write(
-          JSON.stringify({ message: { message: 'Headless build started!' } })
+          JSON.stringify({ message: { started: true, releaseId: '' } })
         );
         res.end();
         headlessReturned = true;
@@ -369,52 +371,68 @@ async function createHttpServer(listenPort: number) {
         const newReleaseId = await getReleaseIdFromCommit(newCommit, token);
         const deltas = await generateDeltas(oldReleaseId, newReleaseId, token);
 
-        await runSpinner(res, spinner, `[Delta] Creating image deltas...`, () =>
-          Promise.all(
-            deltas.map(async (delta) => {
-              log(`Generating delta for ${delta.src} to ${delta.dest}`);
-              const registry = delta.src.split('/')[0];
-              const deltaToken = (
-                await axios.get(
-                  `https://${apiHost}/auth/v1/token?service=${registry}&scope=repository:${delta.src}:pull&scope=repository:${delta.dest}:pull`,
-                  { auth: { username: 'builder', password: builderToken } }
-                )
-              )?.data?.token;
-              return axios
-                .get(
-                  `https://${deltaHost}/api/v3/delta?src=${delta.src}&dest=${delta.dest}&wait=true`,
-                  { headers: { Authorization: `Bearer ${deltaToken}` } }
-                )
-                .then(({ data }) =>
-                  log(`Successfully generated delta: ${data?.name}`)
-                );
-            })
-          )
+        const createDeltas = Promise.all(
+          deltas.map(async (delta) => {
+            log(`Generating delta for ${delta.src} to ${delta.dest}`);
+            const registry = delta.src.split('/')[0];
+            const deltaToken = (
+              await axios.get(
+                `https://${apiHost}/auth/v1/token?service=${registry}&scope=repository:${delta.src}:pull&scope=repository:${delta.dest}:pull`,
+                { auth: { username: 'builder', password: builderToken } }
+              )
+            )?.data?.token;
+            return axios
+              .get(
+                `https://${deltaHost}/api/v3/delta?src=${delta.src}&dest=${delta.dest}&wait=true`,
+                { headers: { Authorization: `Bearer ${deltaToken}` } }
+              )
+              .then(({ data }) =>
+                log(`Successfully generated delta: ${data?.name}`)
+              );
+          })
         );
+
+        if (!headlessReturned) {
+          await runSpinner(
+            res,
+            spinner,
+            `[Delta] Creating image deltas...`,
+            () => createDeltas
+          );
+        } else {
+          await createDeltas;
+        }
       }
 
       if (isdraft === 'false') {
         log('Finalizing release');
 
+        const finalizeRelease = exec(
+          ['/usr/local/bin/balena', 'release', 'finalize', newCommit],
+          workdir,
+          envAdd,
+          false
+        );
+
         const releaseCode = (
-          await runSpinner(
-            res,
-            spinner,
-            `[Release] Finalizing Release...`,
-            () =>
-              exec(
-                ['/usr/local/bin/balena', 'release', 'finalize', newCommit],
-                workdir,
-                envAdd,
-                false
+          !headlessReturned
+            ? await runSpinner(
+                res,
+                spinner,
+                `[Release] Finalizing Release...`,
+                () => finalizeRelease
               )
-          )
+            : await finalizeRelease
         ).code;
 
         if (releaseCode === 0) {
           log('Successfully finalized release');
-          const message = '[Success] Release finalized!';
-          res.write(JSON.stringify({ message: { message } }));
+          if (!headlessReturned)
+            res.write(
+              JSON.stringify({
+                message: { message: '[Success] Release finalized!' },
+              })
+            );
         } else throw new Error('Failed to finalize release');
       }
 
