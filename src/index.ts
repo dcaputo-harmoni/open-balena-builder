@@ -348,7 +348,10 @@ async function createHttpServer(listenPort: number) {
         spawnStream.stdout.pipe(outTransform).pipe(res, { end: false });
         spawnStream.stderr.pipe(errTransform).pipe(res, { end: false });
       } else {
-        res.status(200).send('Build started');
+        res.write(
+          JSON.stringify({ message: { message: 'Headless build started!' } })
+        );
+        res.end();
         headlessReturned = true;
       }
 
@@ -418,7 +421,11 @@ async function createHttpServer(listenPort: number) {
       // Delete images or tag images and keep?
     } catch (err) {
       log(`Error: ${err.message}`);
-      if (!headlessReturned) res.status(400).send(err.message);
+      if (!headlessReturned) {
+        res.write(
+          JSON.stringify({ message: { message: err.message, isError: true } })
+        );
+      }
     }
 
     // Delete build directory and all contents
@@ -426,7 +433,7 @@ async function createHttpServer(listenPort: number) {
       fs.rmSync(workdir, { recursive: true });
 
     // Close response
-    res.end();
+    if (!headlessReturned) res.end();
   });
 
   app.listen(listenPort, () => {
