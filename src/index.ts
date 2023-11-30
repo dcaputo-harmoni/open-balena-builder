@@ -349,10 +349,22 @@ async function createHttpServer(listenPort: number) {
         spawnStream.stdout.pipe(outTransform).pipe(res, { end: false });
         spawnStream.stderr.pipe(errTransform).pipe(res, { end: false });
       } else {
-        // To do: parse out releaseId from build stream before returning
-        res.write(
-          JSON.stringify({ message: { started: true, releaseId: '' } })
-        );
+        // To do: Find a way to get releaseId from build stream before returning
+        if (newCommit !== '') {
+          res.write(JSON.stringify({ started: true, releaseId: newCommit }));
+        } else {
+          res.write(
+            JSON.stringify({ started: true, releaseId: 'Coming soon!' })
+          );
+          /*
+          res.write(
+            JSON.stringify({
+              error: 'Unable to parse release id!',
+              message: '',
+            })
+          );
+          */
+        }
         res.end();
         headlessReturned = true;
       }
