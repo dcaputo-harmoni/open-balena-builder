@@ -380,39 +380,46 @@ async function createHttpServer(listenPort: number) {
       if (deltaHost !== '') {
         // Get previous release images
         const oldReleaseId = await getReleaseIdForApp(String(slug), token);
-        const newReleaseId = await getReleaseIdFromCommit(newCommit, token);
-        const deltas = await generateDeltas(oldReleaseId, newReleaseId, token);
 
-        const createDeltas = Promise.all(
-          deltas.map(async (delta) => {
-            log(`Generating delta for ${delta.src} to ${delta.dest}`);
-            const registry = delta.src.split('/')[0];
-            const deltaToken = (
-              await axios.get(
-                `https://${apiHost}/auth/v1/token?service=${registry}&scope=repository:${delta.src}:pull&scope=repository:${delta.dest}:pull`,
-                { auth: { username: 'builder', password: builderToken } }
-              )
-            )?.data?.token;
-            return axios
-              .get(
-                `https://${deltaHost}/api/v3/delta?src=${delta.src}&dest=${delta.dest}&wait=true`,
-                { headers: { Authorization: `Bearer ${deltaToken}` } }
-              )
-              .then(({ data }) =>
-                log(`Successfully generated delta: ${data?.name}`)
-              );
-          })
-        );
-
-        if (!headlessReturned) {
-          await runSpinner(
-            res,
-            spinner,
-            `[Delta] Creating image deltas...`,
-            () => createDeltas
+        // Only generate deltas if there is a previous release
+        if (oldReleaseId) {
+          const newReleaseId = await getReleaseIdFromCommit(newCommit, token);
+          const deltas = await generateDeltas(
+            oldReleaseId,
+            newReleaseId,
+            token
           );
-        } else {
-          await createDeltas;
+          const createDeltas = Promise.all(
+            deltas.map(async (delta) => {
+              log(`Generating delta for ${delta.src} to ${delta.dest}`);
+              const registry = delta.src.split('/')[0];
+              const deltaToken = (
+                await axios.get(
+                  `https://${apiHost}/auth/v1/token?service=${registry}&scope=repository:${delta.src}:pull&scope=repository:${delta.dest}:pull`,
+                  { auth: { username: 'builder', password: builderToken } }
+                )
+              )?.data?.token;
+              return axios
+                .get(
+                  `https://${deltaHost}/api/v3/delta?src=${delta.src}&dest=${delta.dest}&wait=true`,
+                  { headers: { Authorization: `Bearer ${deltaToken}` } }
+                )
+                .then(({ data }) =>
+                  log(`Successfully generated delta: ${data?.name}`)
+                );
+            })
+          );
+
+          if (!headlessReturned) {
+            await runSpinner(
+              res,
+              spinner,
+              `[Delta] Creating image deltas...`,
+              () => createDeltas
+            );
+          } else {
+            await createDeltas;
+          }
         }
       }
 
